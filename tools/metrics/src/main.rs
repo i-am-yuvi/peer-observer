@@ -15,8 +15,9 @@ use shared::net_msg::{message::Msg, reject::RejectReason};
 use shared::prost::Message;
 use shared::util;
 use shared::validation::validation_event;
+use simple_logger::SimpleLogger;
 use std::collections::HashMap;
-use std::time;
+use std::{thread, time, time::Duration};
 
 mod metrics;
 mod metricserver;
@@ -38,6 +39,10 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
+    SimpleLogger::new()
+        .init()
+        .expect("Could not setup logging!!");
+
     log::info!(target: LOG_TARGET, "Starting metrics-server...",);
 
     metrics::RUNTIME_START_TIMESTAMP.set(
@@ -47,34 +52,52 @@ fn main() {
             .as_secs() as i64,
     );
 
-    let sub = Socket::new(Protocol::Sub0).unwrap();
-    sub.dial(&args.address).unwrap();
-
-    let all_topics = vec![];
-    sub.set_opt::<Subscribe>(all_topics).unwrap();
-
     metricserver::start(&args.metrics_address).unwrap();
     log::info!(target: LOG_TARGET, "metrics-server listening on: {}", args.metrics_address);
 
     loop {
-        let msg = sub.recv().unwrap();
-        let unwrapped = event_msg::EventMsg::decode(msg.as_slice()).unwrap();
+        match connect_and_process(&args.address) {
+            Ok(_) => {
+                // If the function returns Ok, it means we've deliberately exited the loop
+                // (which shouldn't happen in this case). We'll log it and continue retrying.
+                log::warn!(target: LOG_TARGET, "Unexpected return from connect_and_process. Retrying...");
+            }
+            Err(e) => {
+                log::error!(target: LOG_TARGET, "Error in connection or processing: {}. Retrying...", e);
+            }
+        }
 
-        if let Some(event) = unwrapped.event {
-            match event {
-                Event::Msg(msg) => {
-                    handle_p2p_message(&msg, unwrapped.timestamp);
+        // Wait for a bit before retrying to avoid hammering the server
+        thread::sleep(Duration::from_secs(100));
+    }
+
+    fn connect_and_process(address: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let sub = Socket::new(Protocol::Sub0).unwrap();
+        sub.dial(address).unwrap();
+
+        let all_topics = vec![];
+        sub.set_opt::<Subscribe>(all_topics).unwrap();
+
+        loop {
+            let msg = sub.recv().unwrap();
+            let unwrapped = event_msg::EventMsg::decode(msg.as_slice()).unwrap();
+
+            if let Some(event) = unwrapped.event {
+                match event {
+                    Event::Msg(msg) => {
+                        handle_p2p_message(&msg, unwrapped.timestamp);
+                    }
+                    Event::Conn(c) => {
+                        handle_connection_event(c.event.unwrap(), unwrapped.timestamp);
+                    }
+                    Event::Addrman(a) => {
+                        handle_addrman_event(&a.event.unwrap());
+                    }
+                    Event::Mempool(m) => {
+                        handle_mempool_event(&m.event.unwrap());
+                    }
+                    Event::Validation(v) => handle_validation_event(&v.event.unwrap()),
                 }
-                Event::Conn(c) => {
-                    handle_connection_event(c.event.unwrap(), unwrapped.timestamp);
-                }
-                Event::Addrman(a) => {
-                    handle_addrman_event(&a.event.unwrap());
-                }
-                Event::Mempool(m) => {
-                    handle_mempool_event(&m.event.unwrap());
-                }
-                Event::Validation(v) => handle_validation_event(&v.event.unwrap()),
             }
         }
     }
